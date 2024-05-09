@@ -1,0 +1,180 @@
+---
+title: "CREA"
+author: "Julian Gebauer"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r load the data, echo=FALSE}
+library(rpart)
+library(rpart.plot)
+library(reflimR)
+library(tidyverse)
+library(ggplot2)
+library(cowplot)
+
+source('segmentation_functions.R')
+
+### Dataset ###
+caliper_ri <- read_csv('data/caliper_ri.csv', show_col_types = FALSE)
+
+
+path <- getwd()
+file_names <- list.files(paste0(path, '/data'), pattern = "\\.csv$", full.names = FALSE)
+
+## added manually
+var_units <- c('[g/L]', '[U/L]', '[mg/dl]', '[U/L]')
+
+#Read Data from csv and omit na
+data_analyte <- read.csv2(file.path(paste0(path, '/data/', 'Creatinine (enzymatic).csv')),
+                          header = TRUE, stringsAsFactors = FALSE, sep = ";", dec = ",", na.strings = "") %>%                           na.omit()
+#convert value to numeric
+data_analyte$VALUE <- as.numeric(data_analyte$VALUE)
+#get the current analyte
+var_analyte <- data_analyte$ANALYTE %>% unique()
+var_unit <- var_units[3]
+
+print(var_analyte)
+print(var_unit)
+```
+
+```{r run rpart}
+df<- data_analyte
+sex_age_rpart <- rpart(VALUE ~ AGE_DAYS + SEX, data = df)
+#plot model
+rpart.plot(sex_age_rpart, box.palette = "RdBu", main = paste0(var_analyte, " ", var_unit))
+#assing leafs to datapoints
+df$leaf <- sex_age_rpart$where
+```
+# Interpretation rpart:
+
+
+```{r calculate stats for Harris & Boyd}
+caliper_stats_unisex <- calc_stats(caliper_ri, data_analyte, var_analyte, sex='U')
+caliper_stats_male <- calc_stats(caliper_ri, data_analyte, var_analyte, sex='M')
+caliper_stats_female <- calc_stats(caliper_ri, data_analyte, var_analyte, sex='F')
+
+## summarize rpart results
+  leafs_unisex_group <- df %>%  group_by(leaf) %>%  summarise(n_sex = n_distinct(SEX)) %>%
+    filter(n_sex == 2) %>% pull(leaf)
+
+## CAVE min_age and max_age for rpart_stats is calculated here
+summary_rpart <- df %>% group_by(leaf, SEX) %>% 
+  summarise( n = n(), min_age = min(AGE_DAYS), max_age = max(AGE_DAYS)) %>%
+  arrange(min_age, max_age) %>% mutate(unisex = if_else(leaf %in% leafs_unisex_group, TRUE, FALSE))
+summary_rpart$analyte <- var_analyte
+
+##only unisex groups from rpart for albumin
+rpart_stats_unisex <- calc_stats(summary_rpart, df, var_analyte, sex='U')
+rpart_stats_male <- calc_stats(summary_rpart, df, var_analyte, sex='M')
+rpart_stats_female <- calc_stats(summary_rpart, df, var_analyte, sex='F')
+```
+
+```{r generating table with deskriptive statistics}
+tbl_caliper <- bind_rows(caliper_stats_unisex, caliper_stats_female, caliper_stats_male) %>%
+  mutate(SEX = if_else(unisex == TRUE, 'M/F', SEX),
+         approach = 'CALIPER')
+tbl_caliper <- bind_cols(tbl_caliper, calc_permissible_uncertainty(tbl_caliper$lower.lim, tbl_caliper$upper.lim)) %>%
+                   select(analyte, approach, sex = SEX, min_age, max_age,                                           
+                        lower.lim, upper.lim, lower.lim.low:upper.lim.upp,
+                        method, mean, sd, n.trunc)
+
+tbl_rpart <- bind_rows(rpart_stats_unisex, rpart_stats_female, rpart_stats_male) %>%
+  mutate(SEX = if_else(unisex == TRUE, 'M/F', SEX),
+         approach = 'rpart') %>% ungroup()
+tbl_rpart <- bind_cols(tbl_rpart, calc_permissible_uncertainty(tbl_rpart$lower.lim, tbl_rpart$upper.lim)) %>%
+                 select(analyte, approach, sex = SEX, min_age, max_age,                                             
+                        lower.lim, upper.lim, lower.lim.low:upper.lim.upp,
+                        method, mean, sd, n.trunc)
+
+tbl <- bind_rows(tbl_rpart, tbl_caliper)
+
+tbl %>% write_csv('results/crea_tbl.csv')
+```
+
+```{r}
+#check if consecutive groups are different
+## for caliper
+print(caliper_stats_unisex)
+calc_HarrisBoyd(caliper_stats_unisex[1,], caliper_stats_unisex[2,])
+calc_HarrisBoyd(caliper_stats_unisex[2,], caliper_stats_unisex[3,])
+calc_HarrisBoyd(caliper_stats_unisex[3,], caliper_stats_unisex[4,])
+calc_HarrisBoyd(caliper_stats_unisex[4,], caliper_stats_unisex[5,])
+## Interpretation: Harris & Boyd indicate splitting is justified
+
+#compare caliper M/F
+calc_HarrisBoyd(caliper_stats_male[1,], caliper_stats_female[1,])
+#gender spliting is justified
+
+
+## for rpart
+print(rpart_stats_unisex)
+calc_HarrisBoyd(rpart_stats_unisex[1,], rpart_stats_unisex[2,])
+calc_HarrisBoyd(rpart_stats_unisex[2,], rpart_stats_unisex[3,])
+calc_HarrisBoyd(rpart_stats_unisex[3,], rpart_stats_unisex[4,])
+## Interpretation splitting is justified
+
+## compare rpart with caliper
+calc_HarrisBoyd(rpart_stats_unisex[1,], caliper_stats_unisex[1,])
+calc_HarrisBoyd(rpart_stats_unisex[2,], caliper_stats_unisex[2,])
+calc_HarrisBoyd(rpart_stats_unisex[3,], caliper_stats_unisex[3,])
+calc_HarrisBoyd(rpart_stats_unisex[4,], caliper_stats_unisex[4,])
+# splits are equvalent
+
+## the 5th caliper segment is sex-devided by rpart
+calc_HarrisBoyd(rpart_stats_female[1,], caliper_stats_unisex[5,])
+calc_HarrisBoyd(rpart_stats_male[1,], caliper_stats_unisex[5,])
+# unisex caliper segment is different from the rpart male or female
+
+calc_HarrisBoyd(rpart_stats_unisex[4,], rpart_stats_male[1,])
+calc_HarrisBoyd(rpart_stats_male[1,], rpart_stats_male[2,])
+#splitting by rpart is justified accoridng to male splits
+
+calc_HarrisBoyd(rpart_stats_male[2,], caliper_stats_male[1,])
+# no difference between rpart an caliper male segment
+
+calc_HarrisBoyd(rpart_stats_unisex[4,], rpart_stats_female[1,])
+# segmenting female from unisex is correct
+
+calc_HarrisBoyd(rpart_stats_female[1,], caliper_stats_female[1,])
+# no difference for female at caliper vs rpart
+```
+
+```{r draw ri}
+x_axis_breaks<- c(30, 182.5, 365, 730, 1460, 2920, 3650, 5110, 6570)
+
+x_axis_labels <- c("30 days", "0.5 year", "1 year", "2 years", "4 years", "8 years", "10 years", "14 years", "18 years")
+
+plot_colours <- c("F" = "indianred", "M" = "cornflowerblue")
+
+# create ri plots
+gr <- ggplot(df, aes(x=AGE_DAYS, y=VALUE, color = SEX)) + geom_jitter() +
+  labs(x = 'Age (days)', y = paste0(var_analyte, ' ', var_unit)) +
+  theme_bw() +
+  scale_color_manual(values = plot_colours) + 
+  scale_x_continuous(breaks = x_axis_breaks, labels = x_axis_labels, guide = guide_axis(angle = 65),
+                     minor_breaks = seq(0, 6935, by = 365)) +
+  labs(color = 'Gender')
+
+
+gr <- draw_ri(gr, rpart_stats_unisex)
+gr <- draw_ri(gr, rpart_stats_male)
+gr <- draw_ri(gr, rpart_stats_female)
+print(gr)
+ggsave(file="results/crea_fig_c.pdf", plot=gr)
+
+gc <- ggplot(df, aes(x=AGE_DAYS, y=VALUE, color = SEX)) + geom_jitter() +
+  labs(x = 'Age (days)', y = paste0(var_analyte, ' ', var_unit)) +
+  theme_bw() +
+  scale_color_manual(values = plot_colours) + 
+  scale_x_continuous(breaks = x_axis_breaks, labels = x_axis_labels, guide = guide_axis(angle = 65),
+                     minor_breaks = seq(0, 6935, by = 365)) +
+  labs(color = 'Gender')
+
+gc <- draw_ri(gc, caliper_stats_unisex)
+gc <- draw_ri(gc, caliper_stats_female)
+gc <- draw_ri(gc, caliper_stats_male)
+
+print(gc)
+ggsave(file="results/crea_fig_b.pdf", plot=gc)
+```
+
